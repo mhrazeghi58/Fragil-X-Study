@@ -1,1094 +1,429 @@
-# ======================================================================
-# WT vs KO spectral analysis + overlays (SHIFT floors + optional L2 norm)
-# UPDATED: ratios are PIXEL-ALIGNED + trapz keepdims compatibility
-# ======================================================================
+# -*- coding: utf-8 -*-
+"""
+FTIR WT vs KO — RAW + 2nd-derivative (SG) using:
+- pixel_indices + cluster_labels from {sid}_umap_kmeans.npz  (ROI mask)
+- spectra cube from maske_cube_{sid}.npz (key 'data' -> H,W,Z)
+- per-sample BG subtraction from bg_first*_mean_spectrum_{sid}.npz (NO wn inside; align by index)
 
-import os, logging, time
+NO resampling. Crop to 960–1800 (step=2).
+
+Update requested:
+- Move legend OUTSIDE the axes (right side), stacked vertically.
+"""
+
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-from contextlib import contextmanager
-from scipy import stats
-import colorsys, matplotlib.colors as mcolors
+from scipy.signal import savgol_filter
 
-# ============================== PATHS / CONFIG ==============================
-cluster_dir = r"D:\Filiz Lab\Data_2024\Brain_Samples\Working_Copy\New folder (2)\output_DG_R\UMAP_clustering_test"
-cube_dir    = r"D:\Filiz Lab\Data_2024\Brain_Samples\Working_Copy\New folder (2)\output_DG_R"
-save_dir    = os.path.join(cube_dir, "WT_KO_bands_Over_3")
+# =========================
+# PATHS
+# =========================
+cluster_dir = r"D:\Filiz Lab\Data_2025\Mid-IR Data\11_18_2025\Area_EX\UMAP_clustering_8Cluster"
+cube_dir    = r"D:\Filiz Lab\Data_2025\Mid-IR Data\11_18_2025\Area_EX"
+bg_dir      = r"D:\Filiz Lab\Data_2025\Mid-IR Data\11_18_2025\Area_B\BG_First300ROI_MeanSpectrum"
+
+save_dir    = os.path.join(cube_dir, "WT_KO_PIXELINDICES")
 os.makedirs(save_dir, exist_ok=True)
+out_prefix  = os.path.join(save_dir, "WT_KO")
 
-out_prefix = os.path.join(save_dir, "WT_KO")
-
-# ---------------------------------------------------------------------------
-sample_names = ["T1","T3","T6","T17","T19","T20","T21",
-                "T10","T11","T12","T13","T14","T15","T22"]
+# =========================
+# SAMPLES / GROUPS
+# =========================
+sample_names = ["T4E","T3E",#"T6","T17","T19","T20","T21",
+                "T1E","T2E",]#"T12","T13","T14","T15","T22"]
 
 groups = {
-    "WT": ["T1","T3","T6","T17","T19","T20","T21"],
-    "KO": ["T10","T11","T12","T13","T14","T15","T22"]
+    "WT": ["T4E","T3E"],#,"T6","T17","T19","T20","T21"],
+    "KO": ["T1E","T2E"]#,"T12","T13","T14","T15","T22"]
 }
-# ---------------------------------------------------------------------------
 
-# ---------------- Cluster selection (Right) ----------------
 selected_clusters = {
-    "T1":[0,1,2,3,4,5,6,7],
-    "T2":[0,1,2,3,4,5,6,7],
-    "T3":[0,1,2,3,4,5,6,7],
-    "T6":[0,1,2,3,4,5,6,7],
-    "T17":[0,1,2,3,4,5,6,7],
-    "T19":[0,1,2,3,4.5,6,7],
-    "T20":[0,1,2,3,4,5,6,7],
-    "T21":[0,1,2,3,4,5,6,7],
-    "T10":[0,1,2,3,4,5,6,7],
-    "T11":[0,1,2,3,4,5,6,7],
-    "T12":[0,1,2,3,4,5,6,7],
-    "T13":[0,1,2,3,4,5,6,7],
-    "T14":[0,1,2,3,4,5,6,7],
-    "T15":[0,1,2,3,4,5,6,7],
-    "T22":[0,1,2,3,4,5,6,7],
+    "T1E":[0,1,2,3,4,5,6,7],
+    "T3E":[0,1,2,3,4,5,6,7],
+    "T2E":[0,1,2,3,4,5,6,7],
+    "T4E":[0,1,2,3,4,5,6,7],
+  #  "T19":[0,1,2,3,4.5,6,7],  # 4.5 dropped
+  #  "T20":[0,1,2,3,4,5,6,7],
+  #  "T21":[0,1,2,3,4,5,6,7],
+  #  "T10":[0,1,2,3,4,5,6,7],
+  #  "T11":[0,1,2,3,4,5,6,7],
+  #  "T12":[0,1,2,3,4,5,6,7],
+  #  "T13":[0,1,2,3,4,5,6,7],
+  #  "T14":[0,1,2,3,4,5,6,7],
+  #  "T15":[0,1,2,3,4,5,6,7],
+  #  "T22":[0,1,2,3,4,5,6,7],
 }
 
-# --------- Spectral / band settings ---------
-try:
-    window
-except NameError:
-    window = 30
+# =========================
+# SETTINGS
+# =========================
+WN_MIN, WN_MAX = 960, 1800
+WN_STEP = 2
+SYNTH_START_FOR_426 = 950   # 426 pts -> 950..1800 step2
+SYNTH_START_FOR_421 = 960   # 421 pts -> 960..1800 step2
 
-TOPK_PER_BAND = 1  # mean of the top-k values inside the window (per pixel)
+SG_WINDOW = 35
+SG_POLY = 3
+DERIV_ORDER = 2
 
-# ---- Dual shift floors ----
-SHIFT_MIN_FLOOR_BANDS  = 0.2
-SHIFT_MIN_FLOOR_RATIOS = 0.5
+DPI = 300
+LINEWIDTH = 3.6
+ALPHA_SEM = 0.35
+FONT_SIZE = 16
 
-# ---- L2 normalization toggles (after shift) ----
-USE_L2_NORM_BANDS  = False
-USE_L2_NORM_RATIOS = False
-EPS = 1e-12
+WT_COLOR = "#2ca02c"  # green
+KO_COLOR = "#d62728"  # red
 
-# ===================== OPTIONAL THICKNESS NORMALIZATION (AREA REF) =====================
-# If you want to reduce thickness scaling for "single-band" plots,
-# you can divide each pixel spectrum by Amide area before extracting.
-# Leave None to disable.
-# Options: None, "amideI", "amideII", "amideI+II", "area_950_1800"
-NORM_MODE_BANDS  = None
-NORM_MODE_RATIOS = None  # ratios already cancel scale; keep None unless you know why
+# square-ish plot area; we will reserve extra right margin for legend
+FIGSIZE = (10.5, 7.2)
 
-# Use polynomial detrend baseline correction? (optional)
-APPLY_POLY_DETREND_BANDS  = False
-APPLY_POLY_DETREND_RATIOS = False
-POLY_DEGREE = 2
+CLUSTER_NPZ_PATTERN = "{sid}_umap_kmeans.npz"
+CUBE_NPZ_PATTERN    = "masked_cube_{sid}.npz"
 
-# ===================== BAND CENTERS (cm-1) =====================
-BAND_1734_CENTER    = 1734.0
-BAND_1734_HALFWIDTH = 13
-BAND_AMIDE_I        = 1655.0
-BAND_AMIDE_II       = 1545.0
-BAND_CH2            = 1464.0
-BAND_CH3            = 1375.0
-BAND_PO2_SYM        = 1080.0
-BAND_PO2_ASYM       = 1235.0
-BAND_CARB_1030      = 1030.0
-BAND_CARB_1155      = 1155.0
-BAND_CARB_HALFWIDTH = 15
-BAND_PO2_HALFWIDTH  = 15
+BG_PATTERNS = [
+    "bg_first30_mean_spectrum_{sid}.npz",
+    "bg_first300_mean_spectrum_{sid}.npz",
+]
+SKIP_BG_IF_MISSING = True
 
-# ===================== MANUAL AXES & PIXEL CAPS =======================
-USE_MANUAL_YLIMS = True
-MANUAL_YLIMS = {
-    "CH2/CH3":           None,
-    "AmideI/AmideII":    None,
-    "single_band":       None,
-}
+# =========================
+# BAND WINDOWS (edit if needed)
+# =========================
+BANDS = [
+    (1735, 1755, "Ester C=O",         "#d67c7c"),
+    (1690, 1715, "Carbonyl (alt)",    "#c39bd3"),
+    (1640, 1680, "Amide I",           "#6aa6d8"),
+    (1600, 1625, "Aromatic / ring",   "#7fb3d5"),
+    (1510, 1580, "Amide II",          "#9bc1e6"),
+    (1450, 1475, "CH2",               "#f0b27a"),
+    (1410, 1445, "COO- / CH bend",    "#f7dc6f"),
+    (1370, 1390, "CH3",               "#f5cba7"),
+    (1310, 1340, "Amide III",         "#82e0aa"),
+    (1230, 1260, "PO2- (asym)",       "#7fbf7f"),
+    (1190, 1225, "C–O / P–O",         "#a9dfbf"),
+    (1120, 1160, "C–O–C / glycogen",  "#a3e4d7"),
+    (1060, 1100, "PO2- (sym)",        "#aed6f1"),
+    (1020, 1055, "Carbohydrate",      "#d6eaf8"),
+]
 
-USE_LOG_Y_FOR = {
-    "CH2/CH3":        False,
-    "AmideI/AmideII": False,
-    "single_band":    False,
-}
+# =========================
+# Helpers
+# =========================
+def clean_cluster_list(lst):
+    out = []
+    for v in lst:
+        if isinstance(v, (int, np.integer)):
+            out.append(int(v))
+        elif isinstance(v, float) and float(v).is_integer():
+            out.append(int(v))
+    return sorted(list(set(out)))
 
-PIXEL_CAP_DEFAULT = 30_000
-PIXEL_CAP_PER_GROUP = {}
-MAX_POINTS_PER_SAMPLE = 2500
+def load_cube_data_3d(sid):
+    p = os.path.join(cube_dir, CUBE_NPZ_PATTERN.format(sid=sid))
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"Missing cube file: {p}")
+    npz = np.load(p, allow_pickle=True)
+    if "data" not in npz.files:
+        raise ValueError(f"{sid}: cube npz has no 'data' key. keys={npz.files}")
+    data = np.asarray(npz["data"])
+    if data.ndim != 3:
+        raise ValueError(f"{sid}: cube 'data' is not 3D. shape={data.shape}")
+    H, W, Z = data.shape
+    return data, H, W, Z
 
-# === Figure text policy ===
-ANNOTATE_STATS_ON_PLOTS = True
-SEED = 1
-rng_global = np.random.default_rng(SEED)
+def synthesize_wn(Z):
+    if Z == 426:
+        return np.arange(SYNTH_START_FOR_426, SYNTH_START_FOR_426 + WN_STEP*Z, WN_STEP, dtype=float)
+    if Z == 421:
+        return np.arange(SYNTH_START_FOR_421, SYNTH_START_FOR_421 + WN_STEP*Z, WN_STEP, dtype=float)
+    return np.arange(Z, dtype=float)
 
-# ===================== OVERLAY CONFIG =====================
-WT_REF_STAT = "median"
-WT_REF_PCTL = 50.0
-OVERLAY_ALPHA = 0.75
-OVERLAY_COLOR = (0.85, 0.2, 0.2)
-OVERLAY_COLOR_BELOW = (0.2, 0.2, 0.85)
+def load_bg_mean(sid):
+    bg_path = None
+    for pat in BG_PATTERNS:
+        p = os.path.join(bg_dir, pat.format(sid=sid))
+        if os.path.exists(p):
+            bg_path = p
+            break
+    if bg_path is None:
+        return None, None
 
-# ========================== LOGGING & UTILS ==========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger("WT_KO")
+    npz = np.load(bg_path, allow_pickle=True)
+    for k in npz.files:
+        a = np.asarray(npz[k])
+        if np.issubdtype(a.dtype, np.number) and a.ndim == 1 and a.size > 50:
+            return a.astype(float).ravel(), bg_path
+    raise ValueError(f"{sid}: BG npz had no 1D numeric vector. keys={npz.files}")
 
-@contextmanager
-def LogTimer(msg):
-    t0 = time.time(); logger.info(msg + " ...")
-    try:
-        yield
-    finally:
-        logger.info("%s done in %.2fs", msg, time.time() - t0)
+def load_cluster_indices_and_labels(sid, H, W):
+    p = os.path.join(cluster_dir, CLUSTER_NPZ_PATTERN.format(sid=sid))
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"Missing cluster file: {p}")
+    npz = np.load(p, allow_pickle=True)
 
-# ========================== CLEAN selected_clusters ===================
-def _clean_selected_clusters(raw, n_clusters=8):
-    cleaned = {}
-    for name, lst in raw.items():
-        ints = []
-        for x in lst:
-            try:
-                xi = int(x)
-            except Exception:
-                continue
-            if 0 <= xi < n_clusters:
-                ints.append(xi)
-        cleaned[name] = sorted(set(ints))
-    return cleaned
+    if "cluster_labels" not in npz.files:
+        raise ValueError(f"{sid}: cluster npz missing 'cluster_labels'. keys={npz.files}")
+    if "pixel_indices" not in npz.files:
+        raise ValueError(f"{sid}: cluster npz missing 'pixel_indices'. keys={npz.files}")
 
-selected_clusters = _clean_selected_clusters(selected_clusters, n_clusters=8)
+    labels = np.asarray(npz["cluster_labels"]).astype(np.int32, copy=False)
+    pix = np.asarray(npz["pixel_indices"])
 
-# ========================== STYLE & CONSTANTS =========================
-BASE_WT = "#2ca02c"
-BASE_KO = "#d62728"
-
-DOT_SIZE     = 5
-JITTER_SCALE = 0.06
-USE_VIOLIN_BACKGROUND = True
-SAVE_PDF_ALSO = True
-SHOW_SAMPLE_LEGEND = False
-
-PUB_DPI = 600
-FONT_FAMILY = "Arial"
-BASE_FONTSIZE = 11
-
-FS = {
-    "base":   int(BASE_FONTSIZE),
-    "axes":   int(BASE_FONTSIZE + 1),
-    "title":  int(BASE_FONTSIZE + 3),
-    "tick":   int(BASE_FONTSIZE),
-    "annot":  10,
-    "legend": int(BASE_FONTSIZE),
-}
-
-VIOLIN_WT_COLOR = (0.3, 0.7, 0.3, 0.18)
-VIOLIN_KO_COLOR = (0.9, 0.3, 0.3, 0.22)
-
-TRIM_FOR_PLOTTING_ONLY = True
-APPLY_RATIO_HARD_CAP = True
-RATIO_HARD_CAP       = 10.0
-
-# Guard thresholds (used for overlays and now also for ratio stats)
-DENOM_MIN_PCT        = 3.0
-DENOM_ABS_FLOOR      = 1e-2
-NUM_MIN_PCT          = 15.0
-NUM_ABS_FLOOR        = 1e-4
-
-# ========================== BAND LIBRARY ======================
-BAND_LIBRARY = {
-    "1734":       (BAND_1734_CENTER, BAND_1734_HALFWIDTH),
-    "amideI":     (BAND_AMIDE_I,     window),
-    "amideII":    (BAND_AMIDE_II,    window),
-    "ch2":        (BAND_CH2,         window),
-    "ch3":        (BAND_CH3,         window),
-    "po2_1080":   (BAND_PO2_SYM,     BAND_PO2_HALFWIDTH),
-    "po2_1235":   (BAND_PO2_ASYM,    BAND_PO2_HALFWIDTH),
-    "carb_1030":  (BAND_CARB_1030,   BAND_CARB_HALFWIDTH),
-    "carb_1155":  (BAND_CARB_1155,   BAND_CARB_HALFWIDTH),
-}
-
-BAND_LABELS = {
-    "1734":      "Abs @ 1734 cm$^{-1}$",
-    "amideI":    "Amide I intensity",
-    "amideII":   "Amide II intensity",
-    "ch2":       "CH$_2$ intensity (~1464 cm$^{-1}$)",
-    "ch3":       "CH$_3$ intensity (~1375 cm$^{-1}$)",
-    "po2_1080":  "Phosphate ~1080 cm$^{-1}$ intensity",
-    "po2_1235":  "Phosphate ~1235 cm$^{-1}$ intensity",
-    "carb_1030": "Carbohydrate ~1030 cm$^{-1}$ intensity",
-    "carb_1155": "Carbohydrate ~1155 cm$^{-1}$ intensity",
-}
-
-# ========================== STYLE APPLIER =============================
-def _apply_pub_style():
-    fam = FONT_FAMILY or "DejaVu Sans"
-    plt.rcParams.update({
-        "figure.dpi": 300,
-        "savefig.dpi": PUB_DPI,
-        "font.family": fam,
-        "font.size":   FS["base"],
-        "axes.labelsize": FS["axes"],
-        "axes.titlesize": FS["title"],
-        "xtick.labelsize": FS["tick"],
-        "ytick.labelsize": FS["tick"],
-        "axes.linewidth": 0.8,
-        "grid.color": "#9aa0a6",
-        "grid.alpha": 0.35,
-        "grid.linestyle": "--",
-        "grid.linewidth": 0.4,
-        "mathtext.default": "regular",
-    })
-
-# ========================== IO HELPERS ================================
-def _load_cluster_labels_indices(sample):
-    f = os.path.join(cluster_dir, f"{sample}_umap_kmeans.npz")
-    if not os.path.exists(f):
-        logger.warning("Missing cluster file for %s", sample); return None
-    z = np.load(f)
-    return z["cluster_labels"], z["pixel_indices"]
-
-def _load_padded_cube(sample, expected_bands=426):
-    f = os.path.join(cube_dir, f"masked_cube_{sample}.npz")
-    if not os.path.exists(f):
-        logger.warning("Missing RAW cube for %s", sample); return None
-    cube = np.load(f)["data"]  # (H,W,Z)
-    H, W, Z = cube.shape
-    if Z < expected_bands:
-        missing = expected_bands - Z
-        logger.warning("%s: missing %d bands – padding with front edge values", sample, missing)
-        edge = cube[:, :, :1]
-        pad  = np.repeat(edge, missing, axis=2)
-        cube = np.concatenate([pad, cube], axis=2)
-    elif Z > expected_bands:
-        logger.warning("%s: has %d extra bands – trimming from start", sample, Z - expected_bands)
-        cube = cube[:, :, -expected_bands:]
-    return cube
-
-def _selected_mask_from_clusters(H, W, labels, indices, sel_lst):
-    if indices.ndim == 2 and indices.shape[1] == 2:
-        rows = indices[:, 0]; cols = indices[:, 1]
-        use = np.isin(labels, sel_lst); r = rows[use]; c = cols[use]
-        m = np.zeros((H, W), dtype=bool); m[r, c] = True
-        return m
+    if pix.ndim == 2 and pix.shape[1] == 2:
+        rc = pix.astype(np.int64, copy=False)
+        rows, cols = rc[:, 0], rc[:, 1]
+        flat_idx = rows * W + cols
+    elif pix.ndim == 2 and pix.shape[0] == 2:
+        rc = pix.astype(np.int64, copy=False)
+        rows, cols = rc[0, :], rc[1, :]
+        flat_idx = rows * W + cols
+    elif pix.ndim == 1:
+        flat_idx = pix.astype(np.int64, copy=False)
     else:
-        flat_idx = indices
-        use = np.isin(labels, sel_lst); flat_use = flat_idx[use]
-        m = np.zeros((H*W,), dtype=bool); m[flat_use] = True
-        return m.reshape(H, W)
-
-# ===================== PREPROCESS (SHIFT + optional L2 + optional norm) ======
-def _shift_spectra_min_floor(cube, floor):
-    C = cube.astype(np.float64, copy=True)
-    mins = np.min(C, axis=2, keepdims=True)
-    add = np.clip(floor - mins, 0.0, None)
-    return C + add
-
-def _l2_normalize_cube(C):
-    norms = np.sqrt(np.sum(C*C, axis=2, keepdims=True)) + EPS
-    return C / norms
-
-def _poly_detrend_spectra(C, wns, deg=2):
-    H, W, Z = C.shape
-    x = wns.astype(np.float64)
-    x = (x - x.mean()) / (x.std() + EPS)
-    V = np.vander(x, deg + 1, increasing=True)   # (Z,deg+1)
-    Y = C.reshape(-1, Z).T                       # (Z,Npix)
-    coef, *_ = np.linalg.lstsq(V, Y, rcond=None) # (deg+1,Npix)
-    baseline = (V @ coef).T.reshape(H, W, Z)
-    return C - baseline
-
-def _ref_area(C, wns, center, halfwidth):
-    """trapz keepdims-compatible: return (H,W,1)"""
-    m = (wns >= (center - halfwidth)) & (wns <= (center + halfwidth))
-    if not np.any(m):
-        return np.ones(C.shape[:2] + (1,), dtype=np.float64)
-    a = np.trapz(C[:, :, m], wns[m], axis=2)   # (H,W)  <-- no keepdims
-    a = np.maximum(a, EPS)
-    return a[..., None]                        # (H,W,1)
-
-def _area_950_1800(C, wns, lo=950.0, hi=1800.0):
-    m = (wns >= lo) & (wns <= hi)
-    if not np.any(m):
-        return np.ones(C.shape[:2] + (1,), dtype=np.float64)
-    a = np.trapz(C[:, :, m], wns[m], axis=2)   # (H,W)
-    a = np.maximum(a, EPS)
-    return a[..., None]
-
-def _normalize_cube(C, wns, norm_mode):
-    if norm_mode is None:
-        return C
-    if norm_mode == "amideI":
-        return C / _ref_area(C, wns, BAND_AMIDE_I, window)
-    if norm_mode == "amideII":
-        return C / _ref_area(C, wns, BAND_AMIDE_II, window)
-    if norm_mode == "amideI+II":
-        return C / (_ref_area(C, wns, BAND_AMIDE_I, window) + _ref_area(C, wns, BAND_AMIDE_II, window) + EPS)
-    if norm_mode == "area_950_1800":
-        return C / _area_950_1800(C, wns, 950.0, 1800.0)
-    logger.warning("Unknown norm_mode=%s; skipping normalization", norm_mode)
-    return C
-
-def _preprocess_cube(cube, wns, *, floor: float, l2: bool, detrend: bool, norm_mode):
-    C = _shift_spectra_min_floor(cube, floor=floor) if floor is not None else cube.astype(np.float64, copy=True)
-    if detrend:
-        C = _poly_detrend_spectra(C, wns, deg=POLY_DEGREE)
-        # after detrend, re-shift lightly to avoid negative issues in ratios
-        if floor is not None:
-            C = _shift_spectra_min_floor(C, floor=floor)
-    if l2:
-        C = _l2_normalize_cube(C)
-    C = _normalize_cube(C, wns, norm_mode)
-    return C
-
-# --- top-k-mean extractor over a band window ---
-def _band_value_topk_mean(cube, wns, center, halfwidth, k=TOPK_PER_BAND):
-    if halfwidth is None or halfwidth <= 0:
-        halfwidth = 10
-    m = (wns >= (center - halfwidth)) & (wns <= (center + halfwidth))
-    if not np.any(m):
-        H, W = cube.shape[:2]
-        return np.full((H, W), np.nan, dtype=float)
-    slab = cube[:, :, m]
-    nwin = slab.shape[2]
-    kk = int(max(1, min(k, nwin)))
-    H, W = slab.shape[:2]
-    flat = slab.reshape(-1, nwin)
-    idx = np.argpartition(flat, -kk, axis=1)[:, -kk:]
-    topk = np.take_along_axis(flat, idx, axis=1)
-    out_flat = np.nanmean(topk, axis=1)
-    return out_flat.reshape(H, W)
-
-_band_value = _band_value_topk_mean
-
-# ========================== SMALL UTILS ================================
-AUTO_PAD_FRAC = 0.1
-
-def _auto_ylim(a, b, log=False, pad_frac=AUTO_PAD_FRAC):
-    vals = np.r_[a, b]; vals = vals[np.isfinite(vals)]
-    if vals.size == 0: return None
-    lo, hi = np.nanpercentile(vals, [1, 99])
-    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi: return None
-    pad = (hi - lo) * pad_frac
-    lo2, hi2 = lo - pad, hi + pad
-    if log: lo2 = max(lo2, 1e-6)
-    return (lo2, hi2)
-
-def _mask_for_ylim(arr, ylim):
-    if ylim is None: return arr
-    lo, hi = ylim
-    return arr[(arr >= lo) & (arr <= hi) & np.isfinite(arr)]
-
-def _denom_guard(den, min_pct=DENOM_MIN_PCT, abs_floor=DENOM_ABS_FLOOR):
-    d = den[np.isfinite(den)]
-    if d.size == 0:
-        return np.full_like(den, False, dtype=bool), abs_floor
-    thr_q = np.nanpercentile(d, min_pct)
-    thr = max(thr_q, abs_floor)
-    return (den > thr), thr
-
-def _num_guard(num, min_pct=NUM_MIN_PCT, abs_floor=NUM_ABS_FLOOR):
-    d = num[np.isfinite(num)]
-    if d.size == 0:
-        return np.full_like(num, False, dtype=bool), abs_floor
-    thr_q = np.nanpercentile(d, min_pct)
-    thr = max(thr_q, abs_floor)
-    return (num > thr), thr
-
-def _annotate(ax, text):
-    if not ANNOTATE_STATS_ON_PLOTS or not text:
-        return
-    ax.text(
-        0.02, 0.98, text,
-        transform=ax.transAxes, ha="left", va="top",
-        fontsize=FS["annot"], color="black",
-        bbox=dict(facecolor="white", edgecolor="none", alpha=0.6, boxstyle="round,pad=0.25")
-    )
-
-def _safe_name(s: str) -> str:
-    out = str(s).replace("/", "_over_").replace("\\", "_")
-    for b in ['"', "'", ":", "*", "?", "<", ">", "|"]:
-        out = out.replace(b, "")
-    return out.replace(" ", "")
-
-# ========================== PLOTTING HELPERS ==========================
-def _group_sample_colors(wt_keys, ko_keys):
-    def ramp(hex_color, n, v_min=0.45, v_max=0.95, s=0.85):
-        r,g,b = mcolors.to_rgb(hex_color)
-        h, _, _ = colorsys.rgb_to_hsv(r, g, b)
-        vs = np.linspace(v_min, v_max, max(n,1))
-        return [colorsys.hsv_to_rgb(h, s, v) for v in vs]
-    wt_cols = ramp(BASE_WT, len(wt_keys))
-    ko_cols = ramp(BASE_KO, len(ko_keys))
-    return {k: wt_cols[i] for i,k in enumerate(wt_keys)}, {k: ko_cols[i] for i,k in enumerate(ko_keys)}
-
-def _strip_plot_by_sample(WT_dict, KO_dict, ylabel, out_png, log_y=False, ylim=None, stats_text=None):
-    _apply_pub_style()
-
-    WT_all = np.concatenate([v for v in WT_dict.values() if len(v) > 0]) if WT_dict else np.array([])
-    KO_all = np.concatenate([v for v in KO_dict.values() if len(v) > 0]) if KO_dict else np.array([])
-
-    if WT_all.size == 0 and KO_all.size == 0:
-        logger.warning("Nothing to plot for %s", out_png)
-        return
-
-    if TRIM_FOR_PLOTTING_ONLY and ylim is not None:
-        WTv = _mask_for_ylim(WT_all, ylim)
-        KOv = _mask_for_ylim(KO_all, ylim)
-    else:
-        WTv, KOv = WT_all, KO_all
-
-    if WTv.size == 0 and KOv.size == 0:
-        logger.warning("All values fell outside ylim for %s; skipping plot.", out_png)
-        return
-
-    fig, ax = plt.subplots(figsize=(11.0, 5.0))
-    rng = np.random.default_rng(0)
-
-    if USE_VIOLIN_BACKGROUND and (WTv.size > 0) and (KOv.size > 0):
-        parts_ko = ax.violinplot([KOv], positions=[1], widths=0.6, showmeans=False, showmedians=False, showextrema=False)
-        parts_ko["bodies"][0].set_facecolor(VIOLIN_KO_COLOR); parts_ko["bodies"][0].set_edgecolor("none")
-        parts_wt = ax.violinplot([WTv], positions=[0], widths=0.6, showmeans=False, showmedians=False, showextrema=False)
-        parts_wt["bodies"][0].set_facecolor(VIOLIN_WT_COLOR); parts_wt["bodies"][0].set_edgecolor("none")
-
-    wt_keys = list(WT_dict.keys()); ko_keys = list(KO_dict.keys())
-    wt_col_map, ko_col_map = _group_sample_colors(wt_keys, ko_keys)
-
-    for s, arr in WT_dict.items():
-        if arr.size == 0: continue
-        arrv = _mask_for_ylim(arr, ylim) if (ylim is not None and TRIM_FOR_PLOTTING_ONLY) else arr
-        if arrv.size == 0: continue
-        xs = 0 + rng.normal(0, JITTER_SCALE, size=arrv.size)
-        ax.scatter(xs, arrv, s=DOT_SIZE, alpha=0.6, c=[wt_col_map.get(s)], edgecolors="none", rasterized=True)
-
-    for s, arr in KO_dict.items():
-        if arr.size == 0: continue
-        arrv = _mask_for_ylim(arr, ylim) if (ylim is not None and TRIM_FOR_PLOTTING_ONLY) else arr
-        if arrv.size == 0: continue
-        xs = 1 + rng.normal(0, JITTER_SCALE, size=arrv.size)
-        ax.scatter(xs, arrv, s=DOT_SIZE, alpha=0.6, c=[ko_col_map.get(s)], edgecolors="none", rasterized=True)
-
-    def _median_iqr(x, xpos):
-        if x.size == 0: return
-        med = np.median(x); q1, q3 = np.quantile(x, [0.05, 0.95])
-        ax.scatter([xpos], [med], s=42, c="white", edgecolors="black", linewidths=0.8, zorder=3)
-        ax.vlines(xpos, q1, q3, colors="black", linewidth=1.2, zorder=3)
-
-    _median_iqr(WTv, 0); _median_iqr(KOv, 1)
-
-    ax.set_xticks([0, 1], ["WT", "KO"])
-    ax.set_ylabel(ylabel)
-
-    if log_y:
-        ax.set_yscale("log")
-        if ylim is not None:
-            ax.set_ylim(max(ylim[0], 1e-6), ylim[1])
-    elif ylim is not None:
-        ax.set_ylim(*ylim)
-
-    ax.yaxis.grid(True)
-    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-    _annotate(ax, stats_text)
-
-    fig.tight_layout()
-    fig.savefig(out_png, bbox_inches="tight", dpi=PUB_DPI)
-    if SAVE_PDF_ALSO:
-        root, _ = os.path.splitext(out_png)
-        fig.savefig(root + ".pdf", bbox_inches="tight", dpi=PUB_DPI)
-    plt.close(fig)
-
-def _overlay_violin(WT_dict, KO_dict, ylabel, out_png, log_y=False, ylim=None, stats_text=None):
-    _apply_pub_style()
-
-    WT_all = np.concatenate([v for v in WT_dict.values() if len(v) > 0]) if WT_dict else np.array([])
-    KO_all = np.concatenate([v for v in KO_dict.values() if len(v) > 0]) if KO_dict else np.array([])
-
-    if WT_all.size == 0 and KO_all.size == 0:
-        logger.warning("Nothing to overlay for %s", out_png); return
-
-    if TRIM_FOR_PLOTTING_ONLY and ylim is not None:
-        WTv = _mask_for_ylim(WT_all, ylim)
-        KOv = _mask_for_ylim(KO_all, ylim)
-    else:
-        WTv, KOv = WT_all, KO_all
-
-    if WTv.size == 0 and KOv.size == 0:
-        logger.warning("All overlay values fell outside ylim for %s; skipping.", out_png)
-        return
-
-    fig, ax = plt.subplots(figsize=(6.6, 5.0))
-
-    if KOv.size > 0:
-        parts_ko = ax.violinplot([KOv], positions=[0], widths=0.7, showmeans=False, showmedians=False, showextrema=False)
-        bko = parts_ko["bodies"][0]; bko.set_facecolor(VIOLIN_KO_COLOR); bko.set_edgecolor("none"); bko.set_zorder(1)
-
-    if WTv.size > 0:
-        parts_wt = ax.violinplot([WTv], positions=[0], widths=0.7, showmeans=False, showmedians=False, showextrema=False)
-        bwt = parts_wt["bodies"][0]; bwt.set_facecolor(VIOLIN_WT_COLOR); bwt.set_edgecolor("none"); bwt.set_zorder(2)
-
-    def _median_iqr(x, xpos, z=3):
-        if x.size == 0: return
-        med = np.median(x); q1, q3 = np.quantile(x, [0.25, 0.75])
-        ax.scatter([xpos], [med], s=46, c="white", edgecolors="black", linewidths=0.9, zorder=z)
-        ax.vlines(xpos, q1, q3, colors="black", linewidth=1.2, zorder=z)
-
-    _median_iqr(KOv, 0, z=2.2); _median_iqr(WTv, 0, z=2.5)
-
-    ax.set_xticks([0], ["WT on KO"])
-    ax.set_xlim(-0.8, 0.8)
-    ax.set_ylabel(ylabel)
-
-    if log_y:
-        ax.set_yscale("log")
-        if ylim is not None:
-            ax.set_ylim(max(ylim[0], 1e-6), ylim[1])
-    elif ylim is not None:
-        ax.set_ylim(*ylim)
-
-    ax.yaxis.grid(True)
-    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-    _annotate(ax, stats_text)
-
-    fig.tight_layout()
-    fig.savefig(out_png, bbox_inches="tight", dpi=PUB_DPI)
-    if SAVE_PDF_ALSO:
-        root, _ = os.path.splitext(out_png)
-        fig.savefig(root + ".pdf", bbox_inches="tight", dpi=PUB_DPI)
-    plt.close(fig)
-
-# ========================== STATISTICS (Cliff's only) =================
-def _fast_mwu_U(x, y):
-    x = np.asarray(x); y = np.asarray(y)
-    ranks = stats.rankdata(np.concatenate([x, y]))
-    rx = ranks[:len(x)]
-    U = rx.sum() - len(x) * (len(x) + 1) / 2.0
-    return float(U)
-
-def cliffs_delta(WT, KO):
-    WT = np.asarray(WT); KO = np.asarray(KO)
-    nx, ny = len(WT), len(KO)
-    if nx == 0 or ny == 0:
-        return np.nan
-    U = _fast_mwu_U(WT, KO)
-    return float((2.0 * U) / (nx * ny) - 1.0)
-
-def bootstrap_ci(stat_fn, x, y, nboot=3000, alpha=0.05, rng=None):
-    if rng is None: rng = rng_global
-    x = np.asarray(x); y = np.asarray(y)
-    nx, ny = len(x), len(y)
-    if nx == 0 or ny == 0: return (np.nan, np.nan)
-    vals = []
-    for _ in range(nboot):
-        xb = x[rng.integers(0, nx, nx)]
-        yb = y[rng.integers(0, ny, ny)]
-        vals.append(stat_fn(xb, yb))
-    lo, hi = np.quantile(vals, [alpha/2, 1 - alpha/2])
-    return float(lo), float(hi)
-
-def pairwise_preference(WT, KO, max_pairs=200_000, rng=None):
-    if rng is None: rng = rng_global
-    WT = np.asarray(WT); KO = np.asarray(KO)
-    nW, nK = len(WT), len(KO)
-    if nW == 0 or nK == 0:
-        return (np.nan, np.nan, np.nan)
-    P = min(max_pairs, nW * nK)
-    i = rng.integers(0, nW, P); j = rng.integers(0, nK, P)
-    a = WT[i]; b = KO[j]
-    p_wt = np.mean(a > b); p_ko = np.mean(b > a)
-    p_tie = 1.0 - p_wt - p_ko
-    return float(p_wt), float(p_ko), float(p_tie)
-
-def cliffs_only_stats(name, WT, KO):
-    WT = np.asarray(WT); KO = np.asarray(KO)
-    n_wt, n_ko = len(WT), len(KO)
-    if n_wt == 0 or n_ko == 0:
-        return {
-            "metric": name, "n_wt": n_wt, "n_ko": n_ko,
-            "mean_wt": np.nan, "mean_ko": np.nan,
-            "median_wt": np.nan, "median_ko": np.nan,
-            "sd_wt": np.nan, "sd_ko": np.nan,
-            "cliffs_delta": np.nan, "cliffs_delta_lo": np.nan, "cliffs_delta_hi": np.nan,
-            "median_diff": np.nan, "median_diff_lo": np.nan, "median_diff_hi": np.nan,
-            "p_wt_gt_ko": np.nan, "p_ko_gt_wt": np.nan, "p_tie": np.nan
-        }
-    delta = cliffs_delta(WT, KO)
-    d_lo, d_hi = bootstrap_ci(cliffs_delta, WT, KO, nboot=3000)
-    med_diff_fn = lambda a,b: float(np.median(a) - np.median(b))
-    mdiff = med_diff_fn(WT, KO)
-    md_lo, md_hi = bootstrap_ci(med_diff_fn, WT, KO, nboot=3000)
-    p_wt, p_ko, p_tie = pairwise_preference(WT, KO, max_pairs=200_000)
-    return {
-        "metric": name,
-        "n_wt": n_wt, "n_ko": n_ko,
-        "mean_wt": float(np.mean(WT)), "mean_ko": float(np.mean(KO)),
-        "median_wt": float(np.median(WT)), "median_ko": float(np.median(KO)),
-        "sd_wt": float(np.std(WT, ddof=1)) if n_wt>1 else np.nan,
-        "sd_ko": float(np.std(KO, ddof=1)) if n_ko>1 else np.nan,
-        "cliffs_delta": float(delta), "cliffs_delta_lo": float(d_lo), "cliffs_delta_hi": float(d_hi),
-        "median_diff": float(mdiff), "median_diff_lo": float(md_lo), "median_diff_hi": float(md_hi),
-        "p_wt_gt_ko": float(p_wt), "p_ko_gt_wt": float(p_ko), "p_tie": float(p_tie)
-    }
-
-def save_stats_csv(rows, path):
-    headers = ["metric","n_wt","n_ko","mean_wt","mean_ko","median_wt","median_ko","sd_wt","sd_ko",
-               "cliffs_delta","cliffs_delta_lo","cliffs_delta_hi",
-               "median_diff","median_diff_lo","median_diff_hi",
-               "p_wt_gt_ko","p_ko_gt_wt","p_tie"]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(",".join(headers) + "\n")
-        for r in rows:
-            f.write(",".join(str(r[h]) for h in headers) + "\n")
-    logger.info("Saved stats table: %s", path)
-
-def format_stats_for_title(row):
-    d  = row["cliffs_delta"]
-    return f"δ={d:+.2f}"
-
-# ======================= DATA GATHER (single-band OK as before) =========
-def _collect_per_pixel_values(sample, bands_to_get, *, floor, use_l2, detrend, norm_mode):
-    out = _load_cluster_labels_indices(sample)
-    if out is None: return None
-    labels, indices = out
-    cube = _load_padded_cube(sample)
-    if cube is None: return None
-    H, W, Z = cube.shape
-
-    sel = selected_clusters.get(sample, [])
-    if len(sel) == 0:
-        logger.warning("No selected clusters for %s; skipping", sample); return None
-
-    mask2d = _selected_mask_from_clusters(H, W, labels, indices, sel)
-    if not np.any(mask2d):
-        logger.warning("No pixels in selected clusters for %s; skipping", sample); return None
-
-    wns = np.linspace(950, 1800, Z)
-    cube = _preprocess_cube(cube, wns, floor=floor, l2=use_l2, detrend=detrend, norm_mode=norm_mode)
-
-    per_band = {}
-    for key, (center, halfw) in bands_to_get.items():
-        band_img = _band_value(cube, wns, float(center), halfw if halfw is not None else window)
-        vals = band_img[mask2d].ravel()
-        ok = np.isfinite(vals) & (vals != 0)
-        vals = vals[ok]
-        if len(vals) > MAX_POINTS_PER_SAMPLE:
-            rng = np.random.default_rng(abs(hash((sample, key))) % (2**32))
-            take = rng.choice(len(vals), size=MAX_POINTS_PER_SAMPLE, replace=False)
-            vals = vals[take]
-        per_band[key] = vals
-    return per_band
-
-def _collect_band_for_sample(sample, band_key):
-    center, halfw = BAND_LIBRARY[band_key]
-    per = _collect_per_pixel_values(
-        sample,
-        {"band": (center, halfw)},
-        floor=SHIFT_MIN_FLOOR_BANDS,
-        use_l2=USE_L2_NORM_BANDS,
-        detrend=APPLY_POLY_DETREND_BANDS,
-        norm_mode=NORM_MODE_BANDS
-    )
-    if per is None: return None
-    return per["band"]
-
-def _cap_group(arr, metric_key, seed):
-    cap = PIXEL_CAP_PER_GROUP.get(metric_key, PIXEL_CAP_DEFAULT)
-    if len(arr) <= cap: return arr
-    rng = np.random.default_rng(seed)
-    return arr[rng.choice(len(arr), size=cap, replace=False)]
-
-def _concat(lst): return np.concatenate(lst) if lst else np.array([])
-
-# ======================= RATIO GENERATION (AUTO) =======================
-def build_all_band_vs_amide_ratios():
-    ratios = {}
-    for bkey, (bc, bw) in BAND_LIBRARY.items():
-        if bkey in ("amideI", "amideII"):
-            continue
-        ratios[f"{bkey}/AmideI"]  = {"num": (bc, bw), "den": BAND_LIBRARY["amideI"]}
-        ratios[f"{bkey}/AmideII"] = {"num": (bc, bw), "den": BAND_LIBRARY["amideII"]}
-    return ratios
-
-BASE_RATIOS = {
-    "CH2/CH3":        {"num": BAND_LIBRARY["ch2"],    "den": BAND_LIBRARY["ch3"]},
-    "AmideI/AmideII": {"num": BAND_LIBRARY["amideI"], "den": BAND_LIBRARY["amideII"]},
-}
-
-ALL_BAND_VS_AMIDE_RATIOS = build_all_band_vs_amide_ratios()
-ALL_RATIOS = {}
-ALL_RATIOS.update(BASE_RATIOS)
-ALL_RATIOS.update(ALL_BAND_VS_AMIDE_RATIOS)
-
-# ======================= CRITICAL FIX: aligned ratio collection =========
-def _collect_aligned_band_vectors(sample, band_defs, *, floor, use_l2, detrend, norm_mode):
-    """
-    Extract all requested bands in ONE shared pixel order (aligned).
-    Returns vecs dict: key -> 1D array (same order for all keys)
-    """
-    out = _load_cluster_labels_indices(sample)
-    cube = _load_padded_cube(sample)
-    if out is None or cube is None:
-        return None
-
-    labels, indices = out
-    H, W, Z = cube.shape
-    sel = selected_clusters.get(sample, [])
-    if not sel:
-        logger.warning("No selected clusters for %s; skipping", sample)
-        return None
-
-    mask_sel = _selected_mask_from_clusters(H, W, labels, indices, sel)
-    if not np.any(mask_sel):
-        logger.warning("No selected pixels for %s; skipping", sample)
-        return None
-
-    wns = np.linspace(950, 1800, Z)
-    cube = _preprocess_cube(cube, wns, floor=floor, l2=use_l2, detrend=detrend, norm_mode=norm_mode)
-
-    pix = np.flatnonzero(mask_sel.ravel())  # shared pixel order
-
-    vecs = {}
-    for key, (center, halfw) in band_defs.items():
-        img = _band_value(cube, wns, float(center), halfw if halfw is not None else window)
-        v = img.ravel()[pix]
-        vecs[key] = v
-    return vecs
-
-def _collect_ratios_for_sample_generic(sample, ratio_cfg_dict):
-    """
-    FIXED:
-      - numerator and denominator are from SAME pixels (aligned)
-      - apply num/den guards BEFORE ratio
-      - sample AFTER ratio
-    """
-    band_defs = {}
-    for rkey, cfg in ratio_cfg_dict.items():
-        band_defs[f"__num__{rkey}"] = cfg["num"]
-        band_defs[f"__den__{rkey}"] = cfg["den"]
-
-    vecs = _collect_aligned_band_vectors(
-        sample, band_defs,
-        floor=SHIFT_MIN_FLOOR_RATIOS,
-        use_l2=USE_L2_NORM_RATIOS,
-        detrend=APPLY_POLY_DETREND_RATIOS,
-        norm_mode=NORM_MODE_RATIOS
-    )
-    if vecs is None:
-        return None
-
-    out = {}
-    for rkey in ratio_cfg_dict.keys():
-        num = vecs[f"__num__{rkey}"]
-        den = vecs[f"__den__{rkey}"]
-
-        valid = np.isfinite(num) & np.isfinite(den)
-
-        ok_num, _ = _num_guard(num)
-        ok_den, _ = _denom_guard(den)
-        valid = valid & ok_num & ok_den
-
-        if not np.any(valid):
-            out[rkey] = np.array([], dtype=float)
-            continue
-
-        rr = num[valid] / (den[valid] + EPS)
-
-        if APPLY_RATIO_HARD_CAP:
-            rr = np.clip(rr, 0, RATIO_HARD_CAP)
-
-        rr = rr[np.isfinite(rr) & (rr > 0)]
-
-        # sample AFTER ratio (keeps pairing correct)
-        if rr.size > MAX_POINTS_PER_SAMPLE:
-            rng = np.random.default_rng(abs(hash((sample, rkey))) % (2**32))
-            rr = rr[rng.choice(rr.size, size=MAX_POINTS_PER_SAMPLE, replace=False)]
-
-        out[rkey] = rr
-
-    return out
-
-# ======================= OVERLAY HELPERS (WHITE + red/blue) ===========
-def _ratio_map_for_sample(sample, num_center, num_halfwidth, den_center, den_halfwidth):
-    out = _load_cluster_labels_indices(sample); cube = _load_padded_cube(sample)
-    if out is None or cube is None:
-        return None, None, 0, None
-
-    labels, indices = out
-    H, W, Z = cube.shape
-    wns = np.linspace(950, 1800, Z)
-    cube = _preprocess_cube(
-        cube, wns,
-        floor=SHIFT_MIN_FLOOR_RATIOS,
-        l2=USE_L2_NORM_RATIOS,
-        detrend=APPLY_POLY_DETREND_RATIOS,
-        norm_mode=NORM_MODE_RATIOS
-    )
-
-    sel = selected_clusters.get(sample, [])
-    if not sel:
-        return None, None, 0, None
-
-    mask_sel = _selected_mask_from_clusters(H, W, labels, indices, sel)
-
-    num_img = _band_value(cube, wns, float(num_center), num_halfwidth if num_halfwidth is not None else window)
-    den_img = _band_value(cube, wns, float(den_center), den_halfwidth if den_halfwidth is not None else window)
-
-    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
-        ratio_img = num_img / (den_img + EPS)
-
-    if APPLY_RATIO_HARD_CAP:
-        ratio_img = np.clip(ratio_img, 0, RATIO_HARD_CAP)
-
-    valid = np.isfinite(ratio_img) & (ratio_img > 0)
-    n_sel_valid = int((mask_sel & valid).sum())
-
-    return ratio_img, mask_sel, n_sel_valid, {"num": num_img, "den": den_img}
-
-def compute_wt_ratio_thresholds(groups, cfg_dict):
-    thresholds = {}
-    for rkey, cfg in cfg_dict.items():
-        num_c, num_w = cfg["num"]; den_c, den_w = cfg["den"]
-        all_vals = []
-        for n in groups.get("WT", []):
-            ratio_img, mask_sel, _, _ = _ratio_map_for_sample(n, num_c, num_w, den_c, den_w)
-            if ratio_img is None: continue
-            valid = np.isfinite(ratio_img) & (ratio_img > 0)
-            vals = ratio_img[mask_sel & valid].ravel()
-            if vals.size: all_vals.append(vals)
-        if not all_vals:
-            thresholds[rkey] = np.nan
-            logger.warning("No WT pixels found for ratio '%s' -> threshold NaN", rkey)
-            continue
-        wt_all = np.concatenate(all_vals)
-        thr = float(np.nanpercentile(wt_all, WT_REF_PCTL)) if WT_REF_STAT == "percentile" else float(np.nanmedian(wt_all))
-        thresholds[rkey] = thr
-        logger.info("WT threshold for ratio %s: %.6g (n=%d WT pixels)", rkey, thr, wt_all.size)
-    return thresholds
-
-def _render_white_with_two_overlays(ax, shape_rc, mask_above, mask_below,
-                                    color_above=OVERLAY_COLOR,
-                                    color_below=OVERLAY_COLOR_BELOW,
-                                    alpha=OVERLAY_ALPHA):
+        raise ValueError(f"{sid}: unsupported pixel_indices shape={pix.shape}")
+
+    if flat_idx.size != labels.size:
+        raise ValueError(
+            f"{sid}: pixel_indices and cluster_labels mismatch: "
+            f"{flat_idx.size} vs {labels.size}. pixel_indices shape={pix.shape}"
+        )
+
+    n_pix = H * W
+    if flat_idx.min() < 0 or flat_idx.max() >= n_pix:
+        raise ValueError(
+            f"{sid}: pixel_indices out of bounds. min={flat_idx.min()} max={flat_idx.max()} n_pix={n_pix}"
+        )
+    return flat_idx, labels
+
+def sample_mean_and_sem(sample_mat):
+    mean = np.nanmean(sample_mat, axis=0)
+    n = np.sum(~np.isnan(sample_mat), axis=0)
+    std = np.nanstd(sample_mat, axis=0, ddof=1)
+    sem = std / np.sqrt(np.maximum(n, 1))
+    sem[n < 2] = np.nan
+    return mean, sem, n
+
+def second_derivative_1d(y):
+    y2 = y.copy()
+    if np.any(np.isnan(y2)):
+        x = np.arange(len(y2))
+        good = ~np.isnan(y2)
+        if np.sum(good) < 5:
+            return np.full_like(y2, np.nan)
+        y2[~good] = np.interp(x[~good], x[good], y2[good])
+
+    w = min(SG_WINDOW, len(y2) - (len(y2)+1) % 2)
+    if w < 5:
+        return np.full_like(y2, np.nan)
+    if w % 2 == 0:
+        w -= 1
+    return savgol_filter(y2, window_length=w, polyorder=SG_POLY, deriv=DERIV_ORDER)
+
+# =========================
+# Plot helpers
+# =========================
+def pub_axes(ax):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(axis="both", labelsize=FONT_SIZE)
     ax.set_facecolor("white")
-    ax.set_xticks([]); ax.set_yticks([])
-    ax.set_aspect("equal")
 
-    H, W = shape_rc
-    overlay_blue = np.zeros((H, W, 4), dtype=float)
-    overlay_blue[..., :3] = color_below
-    overlay_blue[..., 3]  = 0.0
-    if mask_below is not None:
-        overlay_blue[mask_below, 3] = alpha
-    ax.imshow(overlay_blue)
+def add_bands(ax, bands):
+    for (x0, x1, label, color) in bands:
+        ax.axvspan(x0, x1, color=color, alpha=0.20, lw=0, zorder=0)
+        ax.text(
+            (x0 + x1) / 2,
+            0.98,
+            label,
+            rotation=90,
+            va="top",
+            ha="center",
+            fontsize=FONT_SIZE - 2,
+            color=color,
+            transform=ax.get_xaxis_transform(),
+            clip_on=False,
+            zorder=5
+        )
 
-    overlay_red = np.zeros((H, W, 4), dtype=float)
-    overlay_red[..., :3] = color_above
-    overlay_red[..., 3]  = 0.0
-    if mask_above is not None:
-        overlay_red[mask_above, 3] = alpha
-    ax.imshow(overlay_red)
+def legend_outside_right(ax):
+    # Put legend outside on the right, stacked vertically
+    ax.legend(
+        frameon=False,
+        fontsize=FONT_SIZE,
+        ncol=1,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.00),  # outside right
+        borderaxespad=0.0,
+        handlelength=2.8,
+        labelspacing=0.6,
+        handletextpad=0.8,
+    )
 
-def make_ratio_overlay_for_sample(sample, rkey, cfg, wt_threshold, out_dir):
-    num_c, num_w = cfg["num"]; den_c, den_w = cfg["den"]
-    os.makedirs(out_dir, exist_ok=True)
+def ylim_robust(mean_a, sem_a, mean_b, sem_b, pad_frac=0.15, p_lo=2, p_hi=98):
+    y = np.r_[mean_a - sem_a, mean_a + sem_a, mean_b - sem_b, mean_b + sem_b]
+    y = y[np.isfinite(y)]
+    if y.size == 0:
+        return (-1, 1)
+    lo = np.percentile(y, p_lo)
+    hi = np.percentile(y, p_hi)
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+        lo = np.nanmin(y)
+        hi = np.nanmax(y)
+    rng = hi - lo
+    if rng == 0:
+        rng = max(abs(hi), 1e-6)
+    return (lo - pad_frac*rng, hi + pad_frac*rng)
 
-    ratio_img, mask_sel, _, bands = _ratio_map_for_sample(sample, num_c, num_w, den_c, den_w)
-    if ratio_img is None or bands is None:
-        logger.warning("Skipping ratio overlay for %s / %s (missing inputs).", sample, rkey)
-        return [{
-            "sample": sample, "ratio": rkey, "n_sel": 0,
-            "n_above": 0, "pct_above": np.nan,
-            "n_below": 0, "pct_below": np.nan,
-            "wt_threshold": wt_threshold, "bg": "white_only"
-        }]
+# =========================
+# Per-sample mean spectrum (union clusters)
+# =========================
+def compute_sample_mean_spectrum(sid, ref_grid=None):
+    cube, H, W, Z = load_cube_data_3d(sid)
+    cube2d = cube.reshape(H * W, Z)
 
-    valid = np.isfinite(ratio_img) & (ratio_img > 0)
-    ok_num, thr_num = _num_guard(bands["num"])
-    ok_den, thr_den = _denom_guard(bands["den"])
-    mask_valid_sel = mask_sel & valid & ok_num & ok_den
-    n_sel = int(mask_valid_sel.sum())
+    wn = synthesize_wn(Z)
+    crop = (wn >= WN_MIN) & (wn <= WN_MAX)
+    wn2 = wn[crop]
 
-    if not np.isfinite(wt_threshold) or n_sel == 0:
-        mask_above = np.zeros_like(mask_sel, dtype=bool)
-        mask_below = np.zeros_like(mask_sel, dtype=bool)
-        n_above = n_below = 0
-        pct_above = pct_below = np.nan
+    if ref_grid is not None:
+        if len(wn2) != len(ref_grid) or not np.allclose(wn2, ref_grid, atol=1e-6, rtol=0):
+            raise ValueError(
+                f"Wavenumber grid mismatch for {sid}.\n"
+                f"{sid}: {wn2[0]}..{wn2[-1]} N={len(wn2)} step={wn2[1]-wn2[0]}\n"
+                f"REF: {ref_grid[0]}..{ref_grid[-1]} N={len(ref_grid)} step={ref_grid[1]-ref_grid[0]}"
+            )
+
+    pix_idx, labels = load_cluster_indices_and_labels(sid, H, W)
+
+    allowed = clean_cluster_list(selected_clusters.get(sid, []))
+    if not allowed:
+        print(f"WARNING: {sid} has no allowed clusters.")
+        return None, None, 0
+
+    keep = np.isin(labels, allowed)
+    sel_idx = pix_idx[keep]
+    n_sel = int(sel_idx.size)
+    if n_sel == 0:
+        print(f"WARNING: {sid} has 0 pixels in selected clusters.")
+        return None, None, 0
+
+    pix_spec = cube2d[sel_idx, :][:, crop].astype(np.float32)
+
+    bg, _ = load_bg_mean(sid)
+    if bg is None:
+        if SKIP_BG_IF_MISSING:
+            print(f"WARNING: BG missing for {sid}. BG subtraction skipped.")
+        bg2 = np.zeros(pix_spec.shape[1], dtype=np.float32)
     else:
-        mask_above = (ratio_img > wt_threshold) & mask_valid_sel
-        mask_below = (ratio_img < wt_threshold) & mask_valid_sel
-        n_above = int(mask_above.sum())
-        n_below = int(mask_below.sum())
-        pct_above = 100.0 * n_above / n_sel if n_sel > 0 else np.nan
-        pct_below = 100.0 * n_below / n_sel if n_sel > 0 else np.nan
+        bg_full = np.zeros(Z, dtype=np.float32)
+        L = min(len(bg), Z)
+        bg_full[:L] = bg[:L].astype(np.float32)
+        bg2 = bg_full[crop]
 
-    safe_ratio = _safe_name(rkey)
-    out_npz = os.path.join(out_dir, f"{sample}_overlay_ratio_{safe_ratio}_RedsBlues.npz")
-    np.savez_compressed(
-        out_npz,
-        mask_above=mask_above.astype(np.uint8),
-        mask_below=mask_below.astype(np.uint8),
-        mask_selected=mask_sel.astype(np.uint8),
-        mask_valid_sel=mask_valid_sel.astype(np.uint8),
-        threshold=float(wt_threshold),
-        ratio_key=rkey,
-        num_center=float(num_c), num_halfwidth=float(num_w),
-        den_center=float(den_c), den_halfwidth=float(den_w),
-        thr_num=float(thr_num), thr_den=float(thr_den),
-        bg_mode="white_only", colors=("red_above", "blue_below")
-    )
+    pix_spec = pix_spec - bg2[None, :]
+    sm = np.nanmean(pix_spec, axis=0)
+    return sm, wn2, n_sel
 
-    _apply_pub_style()
-    fig, ax = plt.subplots(figsize=(6.6, 6.0))
-    _render_white_with_two_overlays(
-        ax, ratio_img.shape, mask_above, mask_below,
-        color_above=OVERLAY_COLOR,
-        color_below=OVERLAY_COLOR_BELOW,
-        alpha=OVERLAY_ALPHA
-    )
-    fig.tight_layout()
-    out_png = os.path.join(out_dir, f"{sample}_overlay_ratio_{safe_ratio}_RedsBlues.png")
-    fig.savefig(out_png, dpi=PUB_DPI, bbox_inches="tight")
-    if SAVE_PDF_ALSO:
-        fig.savefig(out_png.replace(".png", ".pdf"), dpi=PUB_DPI, bbox_inches="tight")
-    plt.close(fig)
+# =========================
+# Reference grid from T1
+# =========================
+sm_ref, grid, _ = compute_sample_mean_spectrum("T1E", ref_grid=None)
+print("REF GRID:", grid[0], "to", grid[-1], "N=", len(grid), "step=", (grid[1] - grid[0]))
 
-    return [{
-        "sample": sample, "ratio": rkey, "n_sel": n_sel,
-        "n_above": int(mask_above.sum()), "pct_above": pct_above,
-        "n_below": int(mask_below.sum()), "pct_below": pct_below,
-        "wt_threshold": float(wt_threshold), "bg": "white_only"
-    }]
+# =========================
+# Collect groups
+# =========================
+def collect_group(group_sids):
+    rows, used = [], []
+    for sid in group_sids:
+        sm, wn2, nsel = compute_sample_mean_spectrum(sid, ref_grid=grid)
+        if sm is None:
+            continue
+        rows.append(sm)
+        used.append(sid)
+    if not rows:
+        return np.zeros((0, len(grid))), used
+    return np.vstack(rows), used
 
-def save_ratio_overlay_summary(rows, out_csv):
-    headers = ["sample", "ratio", "n_sel", "n_above", "pct_above", "n_below", "pct_below", "wt_threshold", "bg"]
-    with open(out_csv, "w", encoding="utf-8") as f:
-        f.write(",".join(headers) + "\n")
-        for r in rows:
-            f.write(",".join(str(r[h]) for h in headers) + "\n")
-    logger.info("Saved ratio overlay summary: %s", out_csv)
+WT_mat, WT_used = collect_group(groups["WT"])
+KO_mat, KO_used = collect_group(groups["KO"])
+print("WT used:", WT_used)
+print("KO used:", KO_used)
 
-# =============================== MAIN =================================
-if __name__ == "__main__":
-    logger.info("NumPy version: %s", np.__version__)
-    logger.info("Shift floors: bands=%.2f, ratios=%.2f | L2: bands=%s ratios=%s",
-                SHIFT_MIN_FLOOR_BANDS, SHIFT_MIN_FLOOR_RATIOS, USE_L2_NORM_BANDS, USE_L2_NORM_RATIOS)
-    logger.info("Detrend: bands=%s ratios=%s | Norm: bands=%s ratios=%s",
-                APPLY_POLY_DETREND_BANDS, APPLY_POLY_DETREND_RATIOS, NORM_MODE_BANDS, NORM_MODE_RATIOS)
-    logger.info("Total ratios: %d", len(ALL_RATIOS))
+# =========================
+# Stats
+# =========================
+wt_mean, wt_sem, _ = sample_mean_and_sem(WT_mat)
+ko_mean, ko_sem, _ = sample_mean_and_sem(KO_mat)
 
-    stats_rows = []
-    sample_to_group = {s: "WT" for s in groups["WT"]}
-    sample_to_group.update({s: "KO" for s in groups["KO"]})
+WT_d2 = np.vstack([second_derivative_1d(WT_mat[i]) for i in range(WT_mat.shape[0])])
+KO_d2 = np.vstack([second_derivative_1d(KO_mat[i]) for i in range(KO_mat.shape[0])])
 
-    # ---------- RATIOS ----------
-    with LogTimer("Collect per-sample ratios for ALL_RATIOS (aligned pixel-wise)"):
-        WT_ratio_dicts = {r: {} for r in ALL_RATIOS.keys()}
-        KO_ratio_dicts = {r: {} for r in ALL_RATIOS.keys()}
+wt2_mean, wt2_sem, _ = sample_mean_and_sem(WT_d2)
+ko2_mean, ko2_sem, _ = sample_mean_and_sem(KO_d2)
 
-        WT_concat = {r: [] for r in ALL_RATIOS.keys()}
-        KO_concat = {r: [] for r in ALL_RATIOS.keys()}
+# =========================
+# Plot
+# =========================
+plt.rcParams.update({"font.size": FONT_SIZE, "axes.linewidth": 2.0})
 
-        for n in sample_names:
-            if sample_to_group.get(n) not in ("WT", "KO"):
-                continue
-            per_ratios = _collect_ratios_for_sample_generic(n, ALL_RATIOS)
-            if per_ratios is None:
-                continue
-            for rkey, arr in per_ratios.items():
-                if arr is None or len(arr) == 0:
-                    continue
-                if sample_to_group[n] == "WT":
-                    WT_ratio_dicts[rkey][n] = arr
-                    WT_concat[rkey].append(arr)
-                else:
-                    KO_ratio_dicts[rkey][n] = arr
-                    KO_concat[rkey].append(arr)
+# RAW
+fig, ax = plt.subplots(figsize=FIGSIZE, constrained_layout=False)
+pub_axes(ax)
 
-    with LogTimer("Make strip+overlay plots for ALL ratios"):
-        for rkey in ALL_RATIOS.keys():
-            WT_all = _concat(WT_concat[rkey])
-            KO_all = _concat(KO_concat[rkey])
+ax.plot(grid, wt_mean, color=WT_COLOR, linewidth=LINEWIDTH, label=f"WT (n={WT_mat.shape[0]})")
+ax.plot(grid, ko_mean, color=KO_COLOR, linewidth=LINEWIDTH, label=f"KO (n={KO_mat.shape[0]})")
 
-            WT_all = _cap_group(WT_all, rkey, seed=100 + abs(hash(rkey)) % 10_000)
-            KO_all = _cap_group(KO_all, rkey, seed=200 + abs(hash(rkey)) % 10_000)
+ax.fill_between(grid, wt_mean-wt_sem, wt_mean+wt_sem, color=WT_COLOR, alpha=ALPHA_SEM, lw=0)
+ax.fill_between(grid, ko_mean-ko_sem, ko_mean+ko_sem, color=KO_COLOR, alpha=ALPHA_SEM, lw=0)
 
-            row = cliffs_only_stats(rkey, WT_all, KO_all)
-            stats_rows.append(row)
+ax.set_xlabel(r"Wavenumber (cm$^{-1}$)")
+ax.set_ylabel("RAW mean (union clusters; BG-sub per sample when available)")
+ax.invert_xaxis()
+ax.set_xlim(WN_MAX, WN_MIN)
 
-            log_y = USE_LOG_Y_FOR.get(rkey, False)
-            ylim = MANUAL_YLIMS.get(rkey, None) if USE_MANUAL_YLIMS else _auto_ylim(WT_all, KO_all, log=log_y)
-            ylabel = rkey.replace("AmideI", "Amide I").replace("AmideII", "Amide II")
+ymin = np.nanmin(np.r_[wt_mean - wt_sem, ko_mean - ko_sem])
+ymax = np.nanmax(np.r_[wt_mean + wt_sem, ko_mean + ko_sem])
+ax.set_ylim(ymin - 0.05, ymax + 0.18)
 
-            _strip_plot_by_sample(
-                WT_ratio_dicts[rkey], KO_ratio_dicts[rkey],
-                ylabel=ylabel,
-                out_png=os.path.join(save_dir, f"ratio_{_safe_name(rkey)}_strip_by_sample.png"),
-                log_y=log_y, ylim=ylim,
-                stats_text=format_stats_for_title(row)
-            )
-            _overlay_violin(
-                WT_ratio_dicts[rkey], KO_ratio_dicts[rkey],
-                ylabel=ylabel,
-                out_png=os.path.join(save_dir, f"ratio_{_safe_name(rkey)}_overlayviolin.png"),
-                log_y=log_y, ylim=ylim,
-                stats_text=format_stats_for_title(row)
-            )
+add_bands(ax, BANDS)
+legend_outside_right(ax)
 
-    # ---------- SINGLE-BAND intensities ----------
-    with LogTimer("Single-band intensity plots"):
-        for bkey in BAND_LIBRARY.keys():
-            center, halfw = BAND_LIBRARY[bkey]
-            WT_s, KO_s = [], []
-            for n in groups["WT"]:
-                v = _collect_band_for_sample(n, bkey)
-                if v is not None: WT_s.append(v)
-            for n in groups["KO"]:
-                v = _collect_band_for_sample(n, bkey)
-                if v is not None: KO_s.append(v)
+# Reserve space on the right for legend
+fig.subplots_adjust(right=0.78)
 
-            WT_s = _cap_group(_concat(WT_s), f"{bkey}_single", seed=1000 + abs(hash(bkey)) % 10_000)
-            KO_s = _cap_group(_concat(KO_s), f"{bkey}_single", seed=2000 + abs(hash(bkey)) % 10_000)
+raw_out = f"{out_prefix}_RAW_960_1800_step2_BANDS_square_LEGOUT.png"
+fig.savefig(raw_out, dpi=DPI, bbox_inches="tight")
+plt.close(fig)
 
-            row = cliffs_only_stats(f"{bkey}@{center:.1f}", WT_s, KO_s)
-            stats_rows.append(row)
+# D2
+fig, ax = plt.subplots(figsize=FIGSIZE, constrained_layout=False)
+pub_axes(ax)
 
-            WT_d, KO_d = {}, {}
-            for n in sample_names:
-                g = sample_to_group.get(n)
-                if g is None: continue
-                v = _collect_band_for_sample(n, bkey)
-                if v is None or len(v) == 0: continue
-                if g == "WT": WT_d[n] = v
-                else:         KO_d[n] = v
+ax.plot(grid, wt2_mean, color=WT_COLOR, linewidth=LINEWIDTH, label=f"WT (n={WT_d2.shape[0]})")
+ax.plot(grid, ko2_mean, color=KO_COLOR, linewidth=LINEWIDTH, label=f"KO (n={KO_d2.shape[0]})")
 
-            log_y = USE_LOG_Y_FOR.get(bkey, False)
-            ylim = MANUAL_YLIMS.get(bkey, None) if USE_MANUAL_YLIMS else _auto_ylim(WT_s, KO_s, log=log_y)
+ax.fill_between(grid, wt2_mean-wt2_sem, wt2_mean+wt2_sem, color=WT_COLOR, alpha=ALPHA_SEM, lw=0)
+ax.fill_between(grid, ko2_mean-ko2_sem, ko2_mean+ko2_sem, color=KO_COLOR, alpha=ALPHA_SEM, lw=0)
 
-            _strip_plot_by_sample(
-                WT_d, KO_d,
-                ylabel=BAND_LABELS.get(bkey, f"Band {bkey}"),
-                out_png=os.path.join(save_dir, f"band_{bkey}_{int(center)}cm-1_by_sample.png"),
-                log_y=log_y, ylim=ylim,
-                stats_text=format_stats_for_title(row)
-            )
-            _overlay_violin(
-                WT_d, KO_d,
-                ylabel=BAND_LABELS.get(bkey, f"Band {bkey}"),
-                out_png=os.path.join(save_dir, f"band_{bkey}_overlayviolin.png"),
-                log_y=log_y, ylim=ylim,
-                stats_text=format_stats_for_title(row)
-            )
+ax.set_xlabel(r"Wavenumber (cm$^{-1}$)")
+ax.set_ylabel("2nd-derivative mean (SG on sample means)")
+ax.invert_xaxis()
+ax.set_xlim(WN_MAX, WN_MIN)
 
-    # ---------- Save stats ----------
-    if stats_rows:
-        save_stats_csv(stats_rows, out_prefix + "_WT_vs_KO_cliffs_only.csv")
+lo, hi = ylim_robust(wt2_mean, wt2_sem, ko2_mean, ko2_sem, pad_frac=0.20, p_lo=2, p_hi=98)
+ax.set_ylim(lo, hi)
 
-    # ---------- RATIO OVERLAYS ----------
-    if sample_names and groups.get("WT") and groups.get("KO") and selected_clusters:
-        logger.info("Computing WT thresholds per RATIO for overlay…")
-        wt_ratio_thresh = compute_wt_ratio_thresholds(groups, ALL_RATIOS)
+add_bands(ax, BANDS)
+legend_outside_right(ax)
 
-        ratio_rows_all = []
-        with LogTimer("Generate ratio overlays for ALL_RATIOS"):
-            for rkey, cfg in ALL_RATIOS.items():
-                thr = wt_ratio_thresh.get(rkey, np.nan)
-                for n in sample_names:
-                    rows = make_ratio_overlay_for_sample(
-                        sample=n, rkey=rkey, cfg=cfg, wt_threshold=thr, out_dir=save_dir
-                    )
-                    ratio_rows_all.extend(rows)
+fig.subplots_adjust(right=0.78)
 
-        csv_name = f"{_safe_name(os.path.basename(out_prefix))}_RATIO_overlays_vs_WT_ALLbands_to_AmideI_AmideII.csv"
-        save_ratio_overlay_summary(ratio_rows_all, os.path.join(save_dir, csv_name))
+d2_out = f"{out_prefix}_D2_960_1800_step2_BANDS_square_LEGOUT.png"
+fig.savefig(d2_out, dpi=DPI, bbox_inches="tight")
+plt.close(fig)
 
-    logger.info("Done.")
+print("Saved:")
+print(" -", raw_out)
+print(" -", d2_out)

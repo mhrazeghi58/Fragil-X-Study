@@ -1,19 +1,25 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Feb 20 01:09:52 2026
+
+@author: hrazeghikondela
+"""
+
 # ======================================================================
-# WT vs KO spectral analysis + overlays  (FULL UPDATED SCRIPT - OCTAVVS RMieSC FIX)
+# WT vs KO spectral analysis + overlays  (NO BG / NO NORM / NO SCATTER)
 #
 # UPDATED HERE:
-#  - Adds BACKGROUND SUBTRACTION (BG) BEFORE baseline / RMieSC / floor / normalization.
-#  - BG loaded from bg_dir using common filename patterns.
-#  - BG alignment to the *raw* cube axis Z_src (no wn axis in BG): align by index.
-#     * if BG=426 and cube=421 -> drop first 5 BG points (950..958) => align to 960..1800
-#     * else: take first min, pad with edge if needed
+#  - REMOVED background subtraction completely
+#  - REMOVED normalization completely (NORM_MODE_* not used)
+#  - REMOVED scattering correction (OCTAVVS RMieSC) completely
 #
-# Keeps everything else in your script, including:
-#  - OCTAVVS rmiesc(wn, app, ref, ...)
-#  - resample all samples to common axis
-#  - AsLS + optional RMieSC + floor shift + normalization
+# Keeps:
+#  - resample all samples to common axis (handles Z mismatch)
+#  - analysis pixels capped per sample
+#  - plotting uses tiny subsample fraction
+#  - optional baseline (AsLS) + floor shift
 #  - ratios: base + all bands vs Amide I/II + PO2/(carb+lipid)
-#  - scatter + overlay violin in same figure
+#  - scatter + overlay violin in SAME figure
 #
 # ======================================================================
 
@@ -26,17 +32,12 @@ from contextlib import contextmanager
 from scipy import stats, sparse
 from scipy.sparse.linalg import spsolve
 import colorsys, matplotlib.colors as mcolors
-import importlib, pkgutil
-import inspect, traceback
 
 # ============================== PATHS / CONFIG ==============================
 cluster_dir = r"D:\Filiz Lab\Data_2024\Brain_Samples\Working_Copy\New folder (2)\output_DG_R\UMAP_clustering_test"
 cube_dir    = r"D:\Filiz Lab\Data_2024\Brain_Samples\Working_Copy\New folder (2)\output_DG_R"
 
-# >>> BG DIR (EDIT IF NEEDED) <<<
-bg_dir      = r"D:\Filiz Lab\Data_2024\Brain_Samples\Working_Copy\New folder (2)\Area_Right_B\BG_First300ROI_MeanSpectrum"
-
-save_dir    = os.path.join(cube_dir, "WT_KO_bands_Over_BC_RMIEC")
+save_dir    = os.path.join(cube_dir, "WT_KO_bands_NO_BG_NO_NORM_NO_SCATTER")
 os.makedirs(save_dir, exist_ok=True)
 
 out_prefix = os.path.join(save_dir, "WT_KO")
@@ -94,33 +95,9 @@ BASELINE_LAM = 1e6
 BASELINE_P   = 0.01
 BASELINE_NIT = 10
 
-# Thickness/intensity normalization:
-# "none", "l2", "ref_area_amideI", "ref_area_amideII"
-NORM_MODE_BANDS  = "none"
-NORM_MODE_RATIOS = "none"
-
+# Floor shift (stability). You can set these to None if you want NO shifting.
 SHIFT_MIN_FLOOR_BANDS  = 0.2
 SHIFT_MIN_FLOOR_RATIOS = 0.5
-
-# ===================== Background subtraction =====================
-APPLY_BG_SUBTRACTION = True
-SKIP_BG_IF_MISSING   = True
-
-# BG filename patterns (edit if your names differ)
-BG_PATTERNS = [
-    "bg_first300_mean_spectrum_{sid}.npz",
-    "bg_first30_mean_spectrum_{sid}.npz",
-    "bg_mean_spectrum_{sid}.npz",
-    "bg_{sid}.npz",
-]
-
-# ===================== Mie/RMie scattering correction =====================
-SCATTER_BACKEND = "octavvs"   # "none" to disable
-OCTAVVS_VERBOSE_SCAN = True
-
-RMIESC_ITERATIONS = 10
-RMIESC_VERBOSE = False
-RMIESC_REF_MODE = "median"
 
 # ===================== Ratio guards =====================
 APPLY_RATIO_HARD_CAP = True
@@ -328,76 +305,6 @@ def _clean_selected_clusters(raw, n_clusters=8):
 
 selected_clusters = _clean_selected_clusters(selected_clusters_raw, n_clusters=8)
 
-# ========================== BG SUBTRACTION HELPERS =====================
-def _find_bg_file(sample):
-    for pat in BG_PATTERNS:
-        p = os.path.join(bg_dir, pat.format(sid=sample))
-        if os.path.exists(p):
-            return p
-    return None
-
-def _load_bg_vector(sample):
-    """
-    Returns (bg_vec, path) where bg_vec is 1D numeric spectrum.
-    """
-    p = _find_bg_file(sample)
-    if p is None:
-        return None, None
-    z = np.load(p, allow_pickle=True)
-    # pick first 1D numeric key
-    for k in z.files:
-        a = np.asarray(z[k])
-        if np.issubdtype(a.dtype, np.number) and a.ndim == 1 and a.size > 50:
-            return a.astype(np.float64).ravel(), p
-    raise ValueError(f"{sample}: BG file has no 1D numeric vector. keys={z.files}")
-
-def _align_bg_to_Z(bg, Z_src):
-    """
-    Align BG vector to raw cube band count Z_src by index.
-    Rule: if BG=426 and cube=421 -> drop first 5 BG points.
-    Else: take first min and pad with edge if needed.
-    """
-    bg = np.asarray(bg, dtype=np.float64).ravel()
-    if bg.size == Z_src:
-        return bg
-
-    if bg.size == 426 and Z_src == 421:
-        bg2 = bg[5:]
-        if bg2.size >= Z_src:
-            return bg2[:Z_src]
-        # pad if somehow shorter
-        out = np.empty(Z_src, float)
-        out[:bg2.size] = bg2
-        out[bg2.size:] = bg2[-1]
-        return out
-
-    L = min(bg.size, Z_src)
-    out = np.empty(Z_src, dtype=np.float64)
-    out[:L] = bg[:L]
-    if L < Z_src:
-        out[L:] = out[L-1]
-    return out
-
-def _bg_subtract_cube_spectra(X, Z_src, sample):
-    """
-    X: (N, Z_src) raw pixel spectra
-    Returns BG-subtracted X and a flag/path.
-    """
-    if not APPLY_BG_SUBTRACTION:
-        return X, None
-
-    bg, p = _load_bg_vector(sample)
-    if bg is None:
-        if SKIP_BG_IF_MISSING:
-            logger.warning("BG missing for %s -> BG subtraction skipped.", sample)
-            return X, None
-        raise FileNotFoundError(f"BG missing for {sample} in {bg_dir}")
-
-    bgZ = _align_bg_to_Z(bg, Z_src)
-    X2 = X.astype(np.float64, copy=False) - bgZ[None, :]
-    logger.info("%s: BG sub used: %s", sample, os.path.basename(p))
-    return X2, p
-
 # ========================== RESAMPLING (fix Z mismatch) =====================
 def _resample_matrix_to_std(X, Z_src):
     wns_src = np.linspace(ASSUME_SAMPLE_MIN, ASSUME_SAMPLE_MAX, int(Z_src))
@@ -411,7 +318,7 @@ def baseline_als(y, lam=1e6, p=0.01, niter=10):
     w = np.ones(L)
     for _ in range(niter):
         W = sparse.spdiags(w, 0, L, L)
-        Z = (W + lam * (D @ D.T)).tocsc()  # FIX SparseEfficiencyWarning
+        Z = (W + lam * (D @ D.T)).tocsc()
         z = spsolve(Z, w * y)
         w = p * (y > z) + (1 - p) * (y < z)
     return z
@@ -424,148 +331,12 @@ def apply_baseline_matrix(X, lam=1e6, p=0.01, niter=10):
         out[i] = X[i] - b
     return out
 
-# ========================== NORMALIZATION ==============================
-def _l2_normalize_matrix(X):
-    norms = np.sqrt(np.sum(X*X, axis=1, keepdims=True)) + EPS
-    return X / norms
-
-def _ref_area_matrix(X, wns, center, halfwidth):
-    m = (wns >= (center - halfwidth)) & (wns <= (center + halfwidth))
-    if not np.any(m):
-        return np.ones((X.shape[0], 1), float)
-    a = np.trapz(X[:, m], wns[m], axis=1)
-    a = a.reshape(-1, 1)
-    a = np.where(np.isfinite(a) & (a > EPS), a, 1.0)
-    return a
-
-def _normalize_matrix(X, wns, mode: str):
-    mode = (mode or "none").lower()
-    if mode == "none":
-        return X
-    if mode == "l2":
-        return _l2_normalize_matrix(X)
-    if mode == "ref_area_amidei":
-        a = _ref_area_matrix(X, wns, BAND_AMIDE_I, window)
-        return X / (a + EPS)
-    if mode == "ref_area_amideii":
-        a = _ref_area_matrix(X, wns, BAND_AMIDE_II, window)
-        return X / (a + EPS)
-    raise ValueError(f"Unknown norm mode: {mode}")
-
 def _shift_min_floor_matrix(X, floor):
+    if floor is None:
+        return X
     mins = np.min(X, axis=1, keepdims=True)
     add  = np.clip(floor - mins, 0.0, None)
     return X + add
-
-# ========================== OCTAVVS AUTODISCOVERY + FIXED RMieSC CALL =================
-_OCTAVVS_RMIESC = None
-_OCTAVVS_FAIL_COUNT = 0
-_OCTAVVS_MAX_FAILS = 2
-_OCTAVVS_LOGGED_FIRST_ERROR = False
-
-def _try_import(module_path):
-    try:
-        return importlib.import_module(module_path)
-    except Exception:
-        return None
-
-def _find_octavvs_rmiesc(verbose=True):
-    mod = _try_import("octavvs.algorithms.correction")
-    if mod is not None and hasattr(mod, "rmiesc") and callable(getattr(mod, "rmiesc")):
-        return getattr(mod, "rmiesc"), "octavvs.algorithms.correction.rmiesc"
-
-    try:
-        import octavvs  # noqa
-    except Exception as e:
-        if verbose:
-            logger.warning("OCTAVVS not importable: %s", e)
-        return None, None
-
-    found = []
-    import octavvs
-    for m in pkgutil.walk_packages(octavvs.__path__, prefix="octavvs."):
-        mod2 = _try_import(m.name)
-        if mod2 is None:
-            continue
-        if hasattr(mod2, "rmiesc") and callable(getattr(mod2, "rmiesc")):
-            found.append((getattr(mod2, "rmiesc"), m.name + ".rmiesc"))
-
-    if not found:
-        return None, None
-    return found[0][0], found[0][1]
-
-def _build_rmiesc_ref(app, mode="median"):
-    if app.size == 0:
-        return None
-    mode = (mode or "median").lower()
-    if mode == "mean":
-        ref = np.nanmean(app, axis=0)
-    else:
-        ref = np.nanmedian(app, axis=0)
-    ref = np.asarray(ref, dtype=np.float32)
-    if not np.all(np.isfinite(ref)):
-        ref = np.nan_to_num(ref, nan=0.0, posinf=0.0, neginf=0.0)
-    return ref
-
-def _scatter_correct_matrix_rmiesc(X, wns):
-    global _OCTAVVS_RMIESC, _OCTAVVS_FAIL_COUNT, _OCTAVVS_LOGGED_FIRST_ERROR
-
-    if (SCATTER_BACKEND or "none").lower() == "none":
-        return X
-    if (SCATTER_BACKEND or "").lower() != "octavvs":
-        logger.warning("Unknown SCATTER_BACKEND=%s -> no scatter correction", SCATTER_BACKEND)
-        return X
-    if _OCTAVVS_FAIL_COUNT >= _OCTAVVS_MAX_FAILS:
-        return X
-
-    if _OCTAVVS_RMIESC is None:
-        try:
-            import octavvs  # noqa
-        except Exception as e:
-            logger.warning("OCTAVVS not installed/importable -> skipping Mie correction (%s)", e)
-            _OCTAVVS_FAIL_COUNT = _OCTAVVS_MAX_FAILS
-            return X
-
-        fn, nm = _find_octavvs_rmiesc(verbose=True)
-        if fn is None:
-            logger.warning("Could not find OCTAVVS rmiesc -> skipping.")
-            _OCTAVVS_FAIL_COUNT = _OCTAVVS_MAX_FAILS
-            return X
-
-        _OCTAVVS_RMIESC = fn
-        logger.info("Using OCTAVVS rmiesc: %s", nm)
-        try:
-            logger.info("rmiesc signature: %s", str(inspect.signature(_OCTAVVS_RMIESC)))
-        except Exception:
-            pass
-
-    app = np.asarray(X, dtype=np.float32, order="C")
-    wn  = np.asarray(wns, dtype=np.float32)
-
-    ref = _build_rmiesc_ref(app, mode=RMIESC_REF_MODE)
-    if ref is None:
-        return X
-
-    try:
-        out = _OCTAVVS_RMIESC(wn, app, ref, iterations=RMIESC_ITERATIONS, verbose=RMIESC_VERBOSE)
-        out = np.asarray(out)
-        if out.shape == app.shape:
-            return out.astype(np.float64, copy=False)
-        if isinstance(out, (tuple, list)) and len(out) >= 1:
-            out0 = np.asarray(out[0])
-            if out0.shape == app.shape:
-                return out0.astype(np.float64, copy=False)
-    except Exception as e:
-        if not _OCTAVVS_LOGGED_FIRST_ERROR:
-            _OCTAVVS_LOGGED_FIRST_ERROR = True
-            logger.warning("OCTAVVS rmiesc failed (first error) -> will fallback after a few fails.")
-            logger.warning("Exception: %s: %s", type(e).__name__, str(e))
-            logger.warning("Traceback:\n%s", traceback.format_exc())
-
-    _OCTAVVS_FAIL_COUNT += 1
-    logger.warning("OCTAVVS rmiesc failed at runtime -> skipping for this call. (fail %d/%d)",
-                   _OCTAVVS_FAIL_COUNT, _OCTAVVS_MAX_FAILS)
-    return X
 
 # ========================== BAND EXTRACTION (matrix) ===================
 def _band_value_topk_mean_matrix(X, wns, center, halfwidth, k=TOPK_PER_BAND):
@@ -674,38 +445,24 @@ def _collect_selected_pixel_spectra_std(sample):
     rr, cc = np.where(mask2d)
     X = cube[rr, cc, :].astype(np.float64, copy=False)  # (N, Z_src)
 
-    # cap analysis pixels per sample
     if X.shape[0] > MAX_PIXELS_PER_SAMPLE_ANALYSIS:
         rng = np.random.default_rng(abs(hash(sample)) % (2**32))
         take = rng.choice(X.shape[0], size=MAX_PIXELS_PER_SAMPLE_ANALYSIS, replace=False)
         X = X[take]
 
-    # >>> BG subtraction happens on raw axis BEFORE resampling <<<
-    X, _ = _bg_subtract_cube_spectra(X, Z_src=Z_src, sample=sample)
-
-    # resample to common axis
     if X.shape[1] != WN_STD_Z:
         X = _resample_matrix_to_std(X, Z_src=Z_src)
 
     return X, WN_STD
 
-def _preprocess_matrix(X, wns, *, do_baseline: bool, floor: float, norm_mode: str, do_scatter: bool):
+def _preprocess_matrix(X, wns, *, do_baseline: bool, floor: float):
     Y = np.asarray(X, float)
 
-    # 1) baseline (optional)
     if do_baseline:
         Y = apply_baseline_matrix(Y, lam=BASELINE_LAM, p=BASELINE_P, niter=BASELINE_NIT)
 
-    # 2) RMieSC (optional)
-    if do_scatter and (SCATTER_BACKEND.lower() != "none"):
-        Y = _scatter_correct_matrix_rmiesc(Y, wns)
+    Y = _shift_min_floor_matrix(Y, floor)
 
-    # 3) shift floor (stability)
-    if floor is not None:
-        Y = _shift_min_floor_matrix(Y, floor)
-
-    # 4) normalize for thickness/intensity
-    Y = _normalize_matrix(Y, wns, norm_mode)
     return Y
 
 # ========================== Collect ratios per sample ==================
@@ -717,9 +474,7 @@ def _collect_ratios_for_sample(sample, ratio_cfg_dict):
     X = _preprocess_matrix(
         Xraw, wns,
         do_baseline=APPLY_ASLS_BASELINE_RATIOS,
-        floor=SHIFT_MIN_FLOOR_RATIOS,
-        norm_mode=NORM_MODE_RATIOS,
-        do_scatter=True
+        floor=SHIFT_MIN_FLOOR_RATIOS
     )
 
     band_cache = {}
@@ -754,9 +509,7 @@ def _collect_band_for_sample(sample, band_key):
     X = _preprocess_matrix(
         Xraw, wns,
         do_baseline=APPLY_ASLS_BASELINE_BANDS,
-        floor=SHIFT_MIN_FLOOR_BANDS,
-        norm_mode=NORM_MODE_BANDS,
-        do_scatter=True
+        floor=SHIFT_MIN_FLOOR_BANDS
     )
 
     center, halfw = BAND_LIBRARY[band_key]
@@ -869,7 +622,6 @@ def plot_scatter_plus_overlay(WT_dict, KO_dict, ylabel, out_png, log_y=False, yl
     if ANNOTATE_DELTA_ON_SCATTER:
         _annotate(ax_sc, delta_text)
 
-    # Overlay violin: no labels/ticks/delta/medians/IQR
     ax_ov.set_xticks([])
     ax_ov.set_yticks([])
     for sp in ["top", "right", "left", "bottom"]:
@@ -915,14 +667,14 @@ def save_stats_csv(rows, path):
             f.write(",".join(str(r.get(h, "")) for h in headers) + "\n")
     logger.info("Saved stats table: %s", path)
 
-# =============================== MAIN =================================
+# =============================== MAIN ================================
 if __name__ == "__main__":
-    logger.info("BG subtraction=%s | bg_dir=%s", APPLY_BG_SUBTRACTION, bg_dir)
+    logger.info("NO BG | NO NORM | NO SCATTER")
     logger.info("Axis: assume samples %.1f..%.1f -> resample to STD %.1f..%.1f (Z=%d)",
                 ASSUME_SAMPLE_MIN, ASSUME_SAMPLE_MAX, WN_STD_MIN, WN_STD_MAX, WN_STD_Z)
-    logger.info("SCATTER_BACKEND=%s | Baseline bands=%s ratios=%s | Norm bands=%s ratios=%s",
-                SCATTER_BACKEND, APPLY_ASLS_BASELINE_BANDS, APPLY_ASLS_BASELINE_RATIOS,
-                NORM_MODE_BANDS, NORM_MODE_RATIOS)
+    logger.info("Baseline bands=%s ratios=%s | Floors bands=%s ratios=%s",
+                APPLY_ASLS_BASELINE_BANDS, APPLY_ASLS_BASELINE_RATIOS,
+                str(SHIFT_MIN_FLOOR_BANDS), str(SHIFT_MIN_FLOOR_RATIOS))
     logger.info("Analysis pixels/sample=%d | Plot subsample frac=%.4f | Total ratios=%d",
                 MAX_PIXELS_PER_SAMPLE_ANALYSIS, PLOT_SUBSAMPLE_FRAC, len(ALL_RATIOS))
 
@@ -1025,7 +777,6 @@ if __name__ == "__main__":
                 delta_text=format_delta(delta)
             )
 
-    # ---------- SAVE STATS ----------
     if stats_rows:
         save_stats_csv(stats_rows, out_prefix + "_WT_vs_KO_stats.csv")
 

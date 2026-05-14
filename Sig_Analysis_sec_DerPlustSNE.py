@@ -15,7 +15,7 @@ from sklearn.cluster import KMeans
 from matplotlib.colors import ListedColormap
 
 # --- Settings ---
-input_dir = r"D:\Filiz Lab\Data_2024\Brain_Samples\Working_Copy\New folder (2)\output_DG_Whole_R"
+input_dir = r"E:\FILIZ lab\11_25_2024\PFC_KO_1_Results\output_DG_R_EX"
 save_dir = os.path.join(input_dir, "tSNE_clustering")
 os.makedirs(save_dir, exist_ok=True)
 
